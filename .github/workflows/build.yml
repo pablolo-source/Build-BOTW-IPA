@@ -1,0 +1,114 @@
+name: Build BOTW IPA
+
+# HOW TO USE
+# 1. Put this file in a NEW PRIVATE repository at .github/workflows/build.yml
+#    (not a fork: forks of public repos stay public).
+# 2. Add two repository secrets (Settings > Secrets and variables > Actions):
+#      PROD_KEYS  the full text of your prod.keys file
+#      GAME_URLS  one line per game file, in the form:  exact file name|download link
+#                 Keep the ORIGINAL file names (they hold the title ID and version).
+#                 Example:  The Legend of Zelda Breath of the Wild [01007EF00011E000][v0].nsp|https://...
+#                 A .zip is fine; it is unzipped and its NSP/XCI files are used.
+#                 Google Drive links use gdown, mega.nz links use megatools,
+#                 anything else must be a direct download link (Dropbox: end it with ?dl=1).
+# 3. Actions tab > Build BOTW IPA > Run workflow.
+# Never commit game files or keys to the repo. Untested: treat the first run as an experiment.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the job attach the finished IPA to a release in this repo
+
+env:
+  NXNATIVE_REPO: https://github.com/pablolo-source/nxnative-botw.git
+  # This code runs with your keys. Replace "main" with a commit id you have looked at.
+  NXNATIVE_REF: main
+
+jobs:
+  build:
+    runs-on: macos-26        # if this label is refused, try macos-15
+    timeout-minutes: 360     # GitHub's maximum for one job
+
+    steps:
+      - name: Disk space before
+        run: df -h /
+
+      - name: Free disk space
+        run: |
+          xcrun simctl delete all || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf /Library/Developer/DeviceKit || true
+          rm -rf "$HOME/Library/Android" || true
+          df -h /
+
+      - name: Install tools
+        run: |
+          brew install xcodegen zstd spirv-cross glslang megatools
+          brew install --cask dotnet-sdk
+          python3 -m pip install --break-system-packages lz4 capstone fonttools nsz gdown "backports.zstd; python_version < '3.14'"
+
+      - name: Get the code
+        run: |
+          git clone "$NXNATIVE_REPO" nxnative
+          cd nxnative
+          git checkout "$NXNATIVE_REF"
+
+      - name: Download game files
+        env:
+          GAME_URLS: ${{ secrets.GAME_URLS }}
+        run: |
+          mkdir -p "$HOME/game"
+          cd "$HOME/game"
+          while IFS='|' read -r name url <&3; do
+            [ -z "$name" ] && continue
+            echo "Downloading: $name"
+            case "$url" in
+              *drive.google.com*) gdown --fuzzy "$url" -O "$name" ;;
+              *mega.nz*)          megatools dl --path . "$url" ;;
+              *)                  curl -L --fail --retry 3 -o "$name" "$url" ;;
+            esac
+            # unzip each zip right away to keep peak disk use low
+            for z in *.zip; do
+              [ -e "$z" ] || continue
+              ditto -x -k "$z" . && rm -f "$z"
+            done
+          done 3<<< "$GAME_URLS"
+          # move game files out of any sub-folders, then tidy up
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          rm -rf __MACOSX
+          find . -mindepth 1 -type d -empty -delete
+          ls -lh
+          df -h /
+
+      - name: Build the IPA
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/prod.keys"
+          cd nxnative
+          python3 scripts/build_ipa_from_nsp.py "$HOME/game" \
+            -k "$RUNNER_TEMP/prod.keys" \
+            -o "$RUNNER_TEMP/botw.ipa" \
+            --progress lines --no-keep-extracted
+          df -h /
+
+      - name: Split and attach to a private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf "$HOME/game"
+          cd "$RUNNER_TEMP"
+          # a release file can be at most 2 GiB, so cut the IPA into 1900 MiB parts
+          split -b 1900m botw.ipa botw.ipa.part-
+          rm -f botw.ipa
+          shasum -a 256 botw.ipa.part-* > SHA256SUMS.txt
+          tag="botw-$GITHUB_RUN_NUMBER"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+            --notes "IPA in parts. Join them in order (aa, ab, ac, ...) into one .ipa file."
+          gh release upload "$tag" botw.ipa.part-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Remove keys and game files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/prod.keys" "$HOME/game" "$RUNNER_TEMP"/botw.ipa*
