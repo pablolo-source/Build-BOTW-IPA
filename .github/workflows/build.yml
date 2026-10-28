@@ -65,7 +65,7 @@ jobs:
             [ -z "$name" ] && continue
             echo "Downloading: $name"
             case "$url" in
-              *drive.google.com*) gdown --fuzzy "$url" -O "$name" ;;
+              *drive.google.com*) gdown "$url" -O "$name" ;;
               *mega.nz*)          megatools dl --path . "$url" ;;
               *)                  curl -L --fail --retry 3 -o "$name" "$url" ;;
             esac
